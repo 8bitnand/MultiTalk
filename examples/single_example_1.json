@@ -1,7 +1,7 @@
 {
-    "prompt": "A woman is passionately singing into a professional microphone in a recording studio. She wears large black headphones and a dark cardigan over a gray top. Her long, wavy brown hair frames her face as she looks slightly upwards, her mouth open mid-song. The studio is equipped with various audio equipment, including a mixing console and a keyboard, with soundproofing panels on the walls. The lighting is warm and focused on her, creating a professional and intimate atmosphere. A close-up shot captures her expressive performance.",
-    "cond_image": "examples/single/single1.png",
+    "prompt": "A woman is recording a Tech/AI news Reel about a major AI breakthrough. She is framed in a tight, vertical shot, gesturing lightly with her hand to emphasize a point. She is speaking into a compact, visible desktop USB microphone (like a high-end podcast mic), positioned just out of the main shot. She wears a dark cardigan over a gray top and has a confidence-inspiring, expressive look. The background is a stylish, blurred 'work-from-home' tech environment, featuring a large, curved ultra-wide monitor displaying code or data, with subtle, geometric sound-dampening panels visible on the wall. The lighting is warm and directional, emphasizing her face for the close-up shot.",
+    "cond_image": "examples/single/single2.png",
     "cond_audio": {
-        "person1": "examples/single/1.wav"
+        "person1": "examples/single/2.mp3"
     }
 }
