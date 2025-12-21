@@ -172,6 +172,34 @@ def _parse_args():
         choices=['clip', 'streaming'],
         help="clip: generate one video chunk, streaming: long video generation")
     parser.add_argument(
+        "--save_chunks",
+        action="store_true",
+        help="Save intermediate video chunks during streaming generation")
+    parser.add_argument(
+        "--intelligent_chunking",
+        action="store_true",
+        help="Use intelligent audio chunking based on silence detection")
+    parser.add_argument(
+        "--silence_thresh_db",
+        type=float,
+        default=-40,
+        help="Silence threshold in dB for intelligent chunking")
+    parser.add_argument(
+        "--min_silence_len",
+        type=float,
+        default=0.5,
+        help="Minimum silence length in seconds to split on")
+    parser.add_argument(
+        "--min_chunk_duration",
+        type=float,
+        default=2.0,
+        help="Minimum duration of each chunk in seconds")
+    parser.add_argument(
+        "--max_chunk_duration",
+        type=float,
+        default=10.0,
+        help="Maximum duration of each chunk in seconds")
+    parser.add_argument(
         "--sample_steps", type=int, default=None, help="The sampling steps.")
     parser.add_argument(
         "--sample_shift",
@@ -264,6 +292,87 @@ def loudness_norm(audio_array, sr=16000, lufs=-23):
         return audio_array
     normalized_audio = pyln.normalize.loudness(audio_array, loudness, lufs)
     return normalized_audio
+
+def detect_silence_boundaries(audio_path, silence_thresh_db=-40, min_silence_len=0.5, 
+                               min_chunk_duration=2.0, max_chunk_duration=10.0, sr=16000):
+    """
+    Detect silence boundaries in audio and return chunk boundaries.
+    
+    Args:
+        audio_path: Path to audio file
+        silence_thresh_db: Threshold in dB below which is considered silence
+        min_silence_len: Minimum length of silence in seconds to split on
+        min_chunk_duration: Minimum duration of each chunk in seconds
+        max_chunk_duration: Maximum duration of each chunk in seconds
+        sr: Sample rate
+        
+    Returns:
+        List of (start_sample, end_sample) tuples representing chunk boundaries
+    """
+    import librosa
+    
+    # Load audio
+    audio, _ = librosa.load(audio_path, sr=sr, mono=True)
+    
+    # Convert to dB
+    audio_db = librosa.amplitude_to_db(np.abs(audio), ref=np.max)
+    
+    # Find silence regions
+    is_silence = audio_db < silence_thresh_db
+    
+    # Convert min_silence_len to samples
+    min_silence_samples = int(min_silence_len * sr)
+    min_chunk_samples = int(min_chunk_duration * sr)
+    max_chunk_samples = int(max_chunk_duration * sr)
+    
+    # Find silence regions that are long enough
+    silence_starts = []
+    silence_ends = []
+    
+    in_silence = False
+    silence_start = 0
+    
+    for i, silent in enumerate(is_silence):
+        if silent and not in_silence:
+            silence_start = i
+            in_silence = True
+        elif not silent and in_silence:
+            if i - silence_start >= min_silence_samples:
+                silence_starts.append(silence_start)
+                silence_ends.append(i)
+            in_silence = False
+    
+    # Create chunks based on silence boundaries
+    chunks = []
+    current_start = 0
+    
+    for silence_start, silence_end in zip(silence_starts, silence_ends):
+        # Middle of silence region
+        split_point = (silence_start + silence_end) // 2
+        
+        # Check if chunk would be too small
+        if split_point - current_start < min_chunk_samples:
+            continue
+            
+        # Check if chunk would be too large, force split
+        if split_point - current_start > max_chunk_samples:
+            # Split at max_chunk_duration
+            chunks.append((current_start, current_start + max_chunk_samples))
+            current_start = current_start + max_chunk_samples
+            continue
+        
+        chunks.append((current_start, split_point))
+        current_start = split_point
+    
+    # Add final chunk
+    if len(audio) - current_start >= min_chunk_samples:
+        chunks.append((current_start, len(audio)))
+    elif chunks:  # Extend last chunk if final segment is too small
+        chunks[-1] = (chunks[-1][0], len(audio))
+    else:  # Single chunk for entire audio
+        chunks.append((0, len(audio)))
+    
+    return chunks, audio
 
 def audio_prepare_multi(left_path, right_path, audio_type, sample_rate=16000):
 
@@ -535,6 +644,15 @@ def generate(args):
         os.makedirs(args.audio_save_dir,exist_ok=True)
         
         if args.audio_mode=='localfile':
+            # Store original audio paths for intelligent chunking
+            if args.intelligent_chunking:
+                input_data['original_audio_paths'] = {}
+                if len(input_data['cond_audio']) == 2:
+                    input_data['original_audio_paths']['person1'] = input_data['cond_audio']['person1']
+                    input_data['original_audio_paths']['person2'] = input_data['cond_audio']['person2']
+                elif len(input_data['cond_audio']) == 1:
+                    input_data['original_audio_paths']['person1'] = input_data['cond_audio']['person1']
+            
             if len(input_data['cond_audio'])==2:
                 new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
                 audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
@@ -601,21 +719,124 @@ def generate(args):
             num_persistent_param_in_dit=args.num_persistent_param_in_dit
         )
     
-    logging.info("Generating video ...")
-    video = wan_i2v.generate(
-        input_data,
-        size_buckget=args.size,
-        motion_frame=args.motion_frame,
-        frame_num=args.frame_num,
-        shift=args.sample_shift,
-        sampling_steps=args.sample_steps,
-        text_guide_scale=args.sample_text_guide_scale,
-        audio_guide_scale=args.sample_audio_guide_scale,
-        seed=args.base_seed,
-        offload_model=args.offload_model,
-        max_frames_num=args.frame_num if args.mode == 'clip' else 1000,
-        color_correction_strength = args.color_correction_strength,
-        extra_args=args,
+    # Intelligent chunking mode
+    if args.intelligent_chunking and rank == 0:
+        logging.info("Using intelligent audio chunking based on silence detection...")
+        
+        # Detect silence boundaries in the audio
+        audio_path = input_data['video_audio']
+        chunk_boundaries, full_audio = detect_silence_boundaries(
+            audio_path,
+            silence_thresh_db=args.silence_thresh_db,
+            min_silence_len=args.min_silence_len,
+            min_chunk_duration=args.min_chunk_duration,
+            max_chunk_duration=args.max_chunk_duration,
+            sr=16000
+        )
+        
+        logging.info(f"Detected {len(chunk_boundaries)} chunks from audio")
+        
+        all_chunk_videos = []
+        
+        for chunk_idx, (start_sample, end_sample) in enumerate(chunk_boundaries):
+            logging.info(f"Processing chunk {chunk_idx + 1}/{len(chunk_boundaries)}: "
+                        f"samples {start_sample}-{end_sample} "
+                        f"({(end_sample - start_sample) / 16000:.2f}s)")
+            
+            # Extract audio chunk
+            chunk_audio = full_audio[start_sample:end_sample]
+            chunk_duration = len(chunk_audio) / 16000
+            chunk_frames = int(chunk_duration * 25)  # 25 fps
+            
+            # Skip if chunk is too short
+            if chunk_frames < 25:  # Less than 1 second
+                logging.info(f"Skipping chunk {chunk_idx} - too short ({chunk_frames} frames)")
+                continue
+            
+            # Save chunk audio
+            chunk_audio_path = os.path.join(args.audio_save_dir, f'chunk_{chunk_idx}.wav')
+            import soundfile as sf
+            sf.write(chunk_audio_path, chunk_audio, 16000)
+            
+            # Get embeddings for this chunk
+            chunk_input_data = input_data.copy()
+            chunk_input_data['video_audio'] = chunk_audio_path
+            
+            # Process audio embeddings for each person
+            num_persons = len(input_data['cond_audio'])
+            for person_idx in range(1, num_persons + 1):
+                person_key = f'person{person_idx}'
+                if person_key in input_data['cond_audio']:
+                    # Re-extract embedding for this chunk
+                    if args.audio_mode == 'localfile':
+                        # Load original audio for this person and extract chunk
+                        original_audio_path = None
+                        if person_idx == 1 and 'person1' in input_data.get('original_audio_paths', {}):
+                            original_audio_path = input_data['original_audio_paths']['person1']
+                        elif person_idx == 2 and 'person2' in input_data.get('original_audio_paths', {}):
+                            original_audio_path = input_data['original_audio_paths']['person2']
+                        
+                        if original_audio_path and original_audio_path != 'None':
+                            person_audio, _ = librosa.load(original_audio_path, sr=16000, mono=True)
+                            person_chunk = person_audio[start_sample:end_sample] if len(person_audio) > start_sample else person_audio
+                            chunk_emb = get_embedding(person_chunk, wav2vec_feature_extractor, audio_encoder)
+                            chunk_emb_path = os.path.join(args.audio_save_dir, f'chunk_{chunk_idx}_person{person_idx}.pt')
+                            torch.save(chunk_emb, chunk_emb_path)
+                            if person_key not in chunk_input_data['cond_audio']:
+                                chunk_input_data['cond_audio'] = {}
+                            chunk_input_data['cond_audio'][person_key] = chunk_emb_path
+            
+            # Generate video for this chunk
+            logging.info(f"Generating video for chunk {chunk_idx}...")
+            chunk_video = wan_i2v.generate(
+                chunk_input_data,
+                size_buckget=args.size,
+                motion_frame=args.motion_frame,
+                frame_num=min(chunk_frames, args.frame_num),
+                shift=args.sample_shift,
+                sampling_steps=args.sample_steps,
+                text_guide_scale=args.sample_text_guide_scale,
+                audio_guide_scale=args.sample_audio_guide_scale,
+                seed=args.base_seed + chunk_idx,
+                offload_model=args.offload_model,
+                max_frames_num=chunk_frames,
+                color_correction_strength=args.color_correction_strength,
+                extra_args=args,
+            )
+            
+            # Save chunk video immediately
+            if args.save_chunks:
+                chunk_save_path = f"{args.save_file}_chunk_{chunk_idx}"
+                logging.info(f"Saving chunk {chunk_idx} to {chunk_save_path}.mp4")
+                save_video_ffmpeg(chunk_video, chunk_save_path, [chunk_audio_path], high_quality_save=False)
+            
+            all_chunk_videos.append(chunk_video)
+            
+            # Clean up to save memory
+            del chunk_video, chunk_input_data
+            torch.cuda.empty_cache()
+        
+        # Concatenate all chunks
+        logging.info("Concatenating all chunks...")
+        video = torch.cat(all_chunk_videos, dim=1)  # Concatenate along time dimension
+        
+    else:
+        # Original single generation mode
+        logging.info("Generating video ...")
+        video = wan_i2v.generate(
+            input_data,
+            size_buckget=args.size,
+            motion_frame=args.motion_frame,
+            frame_num=args.frame_num,
+            shift=args.sample_shift,
+            sampling_steps=args.sample_steps,
+            text_guide_scale=args.sample_text_guide_scale,
+            audio_guide_scale=args.sample_audio_guide_scale,
+            seed=args.base_seed,
+            offload_model=args.offload_model,
+            max_frames_num=args.frame_num if args.mode == 'clip' else 1000,
+            color_correction_strength = args.color_correction_strength,
+            extra_args=args,
         )
     
 
