@@ -158,8 +158,38 @@ def _parse_args():
     parser.add_argument(
         "--input_json",
         type=str,
-        default='examples.json',
-        help="[meta file] The condition path to generate the video.")
+        default=None,
+        help="[meta file] The condition path to generate the video. If not provided, use --prompt, --image, --audio* instead.")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help="Text prompt describing the video to generate")
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=None,
+        help="Path to reference image")
+    parser.add_argument(
+        "--audio1",
+        type=str,
+        default=None,
+        help="Path to audio file for person 1")
+    parser.add_argument(
+        "--audio2",
+        type=str,
+        default=None,
+        help="Path to audio file for person 2 (optional for multi-person)")
+    parser.add_argument(
+        "--bbox1",
+        type=str,
+        default=None,
+        help="Bounding box for person 1 as 'x1,y1,x2,y2' (optional)")
+    parser.add_argument(
+        "--bbox2",
+        type=str,
+        default=None,
+        help="Bounding box for person 2 as 'x1,y1,x2,y2' (optional)")
     parser.add_argument(
         "--motion_frame",
         type=int,
@@ -633,11 +663,36 @@ def generate(args):
     #     logging.info(f"Extended prompt: {args.prompt}")
 
     # read input files
-
     
-
-    with open(args.input_json, 'r', encoding='utf-8') as f:
-        input_data = json.load(f)
+    # Build input_data from command line args if no JSON provided
+    if args.input_json is None:
+        if args.prompt is None or args.image is None or args.audio1 is None:
+            raise ValueError("Either --input_json or (--prompt, --image, --audio1) must be provided")
+        
+        input_data = {
+            "prompt": args.prompt,
+            "cond_image": args.image,
+            "cond_audio": {
+                "person1": args.audio1
+            }
+        }
+        
+        # Add second person if provided
+        if args.audio2:
+            input_data["cond_audio"]["person2"] = args.audio2
+        
+        # Add bounding boxes if provided
+        if args.bbox1 or args.bbox2:
+            input_data["bbox"] = {}
+            if args.bbox1:
+                coords = [int(x) for x in args.bbox1.split(',')]
+                input_data["bbox"]["person1"] = coords
+            if args.bbox2:
+                coords = [int(x) for x in args.bbox2.split(',')]
+                input_data["bbox"]["person2"] = coords
+    else:
+        with open(args.input_json, 'r', encoding='utf-8') as f:
+            input_data = json.load(f)
         
         wav2vec_feature_extractor, audio_encoder= custom_init('cpu', args.wav2vec_dir)
         args.audio_save_dir = os.path.join(args.audio_save_dir, input_data['cond_image'].split('/')[-1].split('.')[0])
