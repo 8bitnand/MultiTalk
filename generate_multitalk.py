@@ -734,12 +734,30 @@ def generate(args):
             sr=16000
         )
         
-        logging.info(f"Detected {len(chunk_boundaries)} chunks from audio")
+        logging.info(f"Detected {len(chunk_boundaries)} initial chunks from audio")
+        
+        # Merge chunks that are too short with the next chunk
+        min_duration_samples = int(10.0 * 16000)  # 10 seconds in samples
+        merged_boundaries = []
+        i = 0
+        while i < len(chunk_boundaries):
+            start_sample, end_sample = chunk_boundaries[i]
+            
+            # Keep merging with next chunk if current is too short
+            while (end_sample - start_sample) < min_duration_samples and i + 1 < len(chunk_boundaries):
+                logging.info(f"Merging short chunk {i} ({(end_sample - start_sample) / 16000:.2f}s) with next chunk")
+                i += 1
+                _, end_sample = chunk_boundaries[i]  # Extend to end of next chunk
+            
+            merged_boundaries.append((start_sample, end_sample))
+            i += 1
+        
+        logging.info(f"After merging: {len(merged_boundaries)} chunks")
         
         all_chunk_videos = []
         
-        for chunk_idx, (start_sample, end_sample) in enumerate(chunk_boundaries):
-            logging.info(f"Processing chunk {chunk_idx + 1}/{len(chunk_boundaries)}: "
+        for chunk_idx, (start_sample, end_sample) in enumerate(merged_boundaries):
+            logging.info(f"Processing chunk {chunk_idx + 1}/{len(merged_boundaries)}: "
                         f"samples {start_sample}-{end_sample} "
                         f"({(end_sample - start_sample) / 16000:.2f}s)")
             
@@ -748,14 +766,8 @@ def generate(args):
             chunk_duration = len(chunk_audio) / 16000
             chunk_frames = int(chunk_duration * 25)  # 25 fps
             
-            # Skip if chunk is too short
-            if chunk_frames < 25:  # Less than 1 second
-                logging.info(f"Skipping chunk {chunk_idx} - too short ({chunk_frames} frames)")
-                continue
-            
             # Save chunk audio
             chunk_audio_path = os.path.join(args.audio_save_dir, f'chunk_{chunk_idx}.wav')
-            import soundfile as sf
             sf.write(chunk_audio_path, chunk_audio, 16000)
             
             # Get embeddings for this chunk
@@ -806,7 +818,10 @@ def generate(args):
             
             # Save chunk video immediately
             if args.save_chunks:
-                chunk_save_path = f"{args.save_file}_chunk_{chunk_idx}"
+                # Create output folder
+                output_folder = f"{args.save_file}_chunks"
+                os.makedirs(output_folder, exist_ok=True)
+                chunk_save_path = os.path.join(output_folder, f"chunk_{chunk_idx}")
                 logging.info(f"Saving chunk {chunk_idx} to {chunk_save_path}.mp4")
                 save_video_ffmpeg(chunk_video, chunk_save_path, [chunk_audio_path], high_quality_save=False)
             
@@ -816,9 +831,32 @@ def generate(args):
             del chunk_video, chunk_input_data
             torch.cuda.empty_cache()
         
-        # Concatenate all chunks
-        logging.info("Concatenating all chunks...")
-        video = torch.cat(all_chunk_videos, dim=1)  # Concatenate along time dimension
+        # Use ffmpeg to concatenate chunks with proper audio sync
+        logging.info("Concatenating all chunks with ffmpeg...")
+        if args.save_chunks:
+            output_folder = f"{args.save_file}_chunks"
+            concat_list_file = os.path.join(output_folder, "concat_list.txt")
+            with open(concat_list_file, 'w') as f:
+                for i in range(len(merged_boundaries)):
+                    chunk_file = os.path.join(output_folder, f"chunk_{i}.mp4")
+                    if os.path.exists(chunk_file):
+                        f.write(f"file '{os.path.basename(chunk_file)}'\n")
+            
+            # Use ffmpeg to concatenate
+            final_output = os.path.join(output_folder, f"{os.path.basename(args.save_file)}_final.mp4")
+            concat_cmd = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", concat_list_file,
+                "-c", "copy",
+                final_output
+            ]
+            subprocess.run(concat_cmd, check=True)
+            logging.info(f"Final video saved to {final_output}")
+            
+            # Also create tensor concatenation for return
+            video = torch.cat(all_chunk_videos, dim=1)
+        else:
+            video = torch.cat(all_chunk_videos, dim=1)
         
     else:
         # Original single generation mode
@@ -848,8 +886,12 @@ def generate(args):
                                                                         "_")[:50]
             args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
         
-        logging.info(f"Saving generated video to {args.save_file}.mp4")
-        save_video_ffmpeg(video, args.save_file, [input_data['video_audio']], high_quality_save=False)
+        # Only save if not using intelligent chunking (which already saved)
+        if not args.intelligent_chunking:
+            logging.info(f"Saving generated video to {args.save_file}.mp4")
+            save_video_ffmpeg(video, args.save_file, [input_data['video_audio']], high_quality_save=False)
+        else:
+            logging.info(f"Videos saved in {args.save_file}_chunks/ folder")
         
     logging.info("Finished.")
 
