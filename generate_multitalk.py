@@ -247,6 +247,11 @@ def _parse_args():
         default=4.0,
         help="Classifier free guidance scale for audio control.")
     parser.add_argument(
+        "--n_prompt",
+        type=str,
+        default="",
+        help="Negative prompt for generation.")
+    parser.add_argument(
         "--num_persistent_param_in_dit",
         type=int,
         default=None,
@@ -865,6 +870,7 @@ def generate(args):
                 text_guide_scale=args.sample_text_guide_scale,
                 audio_guide_scale=args.sample_audio_guide_scale,
                 seed=args.base_seed + chunk_idx,
+                n_prompt=args.n_prompt,
                 offload_model=args.offload_model,
                 max_frames_num=chunk_frames,
                 color_correction_strength=args.color_correction_strength,
@@ -926,6 +932,7 @@ def generate(args):
             text_guide_scale=args.sample_text_guide_scale,
             audio_guide_scale=args.sample_audio_guide_scale,
             seed=args.base_seed,
+            n_prompt=args.n_prompt,
             offload_model=args.offload_model,
             max_frames_num=args.frame_num if args.mode == 'clip' else 1000,
             color_correction_strength = args.color_correction_strength,
